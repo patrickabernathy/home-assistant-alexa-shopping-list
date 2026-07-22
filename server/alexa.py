@@ -1,34 +1,70 @@
 #!/usr/bin/env python3
 
-from selenium import webdriver
-from selenium.webdriver import ActionChains
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.actions.wheel_input import ScrollOrigin
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import StaleElementReferenceException
+# Phase 2 of docs/json-api-hardening.md: this driver talks to Amazon's private
+# Alexa-list JSON API (https://www.amazon.com/alexashoppinglists/api/) with a
+# plain requests.Session instead of scraping the DOM with Selenium. The API
+# authorizes purely on the session cookies we already persist — no CSRF token,
+# no bearer token — so the fork's crown-jewel auth model is untouched:
+#
+#   * The *client* (client/authenticator.py) still does the one-time real-browser
+#     login and ships cookies.json to the server. Nothing here logs in.
+#   * We consume cookies.json, and re-persist the cookies Amazon rotates on every
+#     response (R1-R7: atomic write + os.replace, throttled), keeping the session
+#     alive across restarts exactly as before.
+#
+# The WebSocket server (server.py) and the HA integration are unchanged: the
+# public method signatures below are identical to the old Selenium driver, and
+# any failure (rejected session / interstitial / bad response) raises, which
+# server.py catches and turns into the clean "please retry" error (commit
+# 4edcab2) — never a traceback.
+
+import requests
 import time
 import json
 import os
 
-WAIT_TIMEOUT=30
+# Per-request network timeout (seconds).
+REQUEST_TIMEOUT = 30
 
 # Persist rotated session cookies at most once per this many seconds (R3).
 # The worker polls ~every 90s, so this is naturally ~1 write per cycle.
-COOKIE_SAVE_THROTTLE_SECONDS=60
+COOKIE_SAVE_THROTTLE_SECONDS = 60
+
+# Present a browser-like UA rather than the default python-requests one, matching
+# the User-Agent the old Selenium scraper used, to stay clear of robot mitigation.
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
 
 class AlexaShoppingList:
 
     def __init__(self, amazon_url: str = "amazon.com", cookies_path: str = ""):
+        # amazon_url is kept for signature parity. server.py forces "amazon.com"
+        # (the fork rule), so the base is https://www.amazon.com in practice.
         self.amazon_url = amazon_url
         self.cookies_path = cookies_path
+        self.base_url = "https://www." + amazon_url
+        self.api_url = self.base_url + "/alexashoppinglists/api"
+
         self._last_cookie_save = 0
-        self._setup_driver()
+        self.is_authenticated = False
+        self._default_list_id = None
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "content-type": "application/json",
+            "accept": "application/json",
+            "user-agent": USER_AGENT,
+        })
+        self._load_cookies()
 
 
     def __del__(self):
-        self._clear_driver()
+        # requests needs no driver teardown, but force a final persist so the
+        # freshest cookie rotation is never lost on a clean shutdown.
+        try:
+            self.save_session(force=True)
+        except Exception:
+            pass
 
     # ============================================================
     # Helpers
@@ -41,78 +77,7 @@ class AlexaShoppingList:
         return os.environ.get("ALEXA_SHOPPING_LIST_DEBUG", "0") == "1"
 
     # ============================================================
-    # Selenium
-
-
-    def _setup_driver(self):
-        user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-
-        chrome_options = Options()
-        if(self._is_debug_mode() == False):
-            chrome_options.add_argument("--headless")
-        chrome_options.add_argument("window-size=1366,768")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument(f"--user-agent={user_agent}")
-
-        driver_path = os.environ.get("CHROME_DRIVER", "")
-        if driver_path != "":
-            service = webdriver.ChromeService(executable_path=driver_path)
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-        else:
-            self.driver = webdriver.Chrome(options=chrome_options)
-
-        self.is_authenticated = False
-        self._selenium_get("https://www."+self.amazon_url, (By.TAG_NAME, 'body'))
-        self._load_cookies()
-
-        if len(self.driver.find_elements(By.ID, 'nav-backup-backup')) > 0:
-            # I don't know why this is, but random amazon displays some weird page instead of the usual home page.
-            # This solution only works for versions of amazon in english, so would cause problems for other languages.
-            # But this only happens rarely, so... whatever.
-            self.driver.find_element(By.CLASS_NAME, "nav-bb-right").find_element(By.LINK_TEXT, "Your Account").click()
-            time.sleep(5)
-
-        if len(self.driver.find_elements(By.CLASS_NAME, 'nav-action-signin-button')) > 0:
-            self.driver.find_element(By.ID, 'nav-link-accountList').click()
-            time.sleep(5)
-        else:
-            self.is_authenticated = True
-
-
-
-    def _clear_driver(self):
-        if hasattr(self, "driver"):
-            # Force a final persist on teardown, bypassing the throttle, so the
-            # freshest rotation is never lost on a clean shutdown.
-            self.save_session(force=True)
-            # A crashed/half-built driver can raise on close; swallow it so
-            # teardown never adds noise to an already-failing command.
-            try:
-                self.driver.close()
-            except Exception:
-                pass
-
-
-    def _selenium_wait_element(self, element: tuple):
-        WebDriverWait(self.driver, WAIT_TIMEOUT).until(EC.presence_of_element_located(element))
-
-
-    def _selenium_wait_page_ready(self):
-        WebDriverWait(self.driver, WAIT_TIMEOUT).until(
-            lambda d: d.execute_script('return document.readyState') == 'complete'
-        )
-
-
-    def _selenium_get(self, url: str, wait_for_element: tuple=None, wait_for_page_load: bool=False):
-        self.driver.get(url)
-
-        if wait_for_element != None:
-            self._selenium_wait_element(wait_for_element)
-
-        if wait_for_page_load:
-            self._selenium_wait_page_ready()
+    # Cookies
 
 
     def _cookie_cache_path(self):
@@ -122,34 +87,58 @@ class AlexaShoppingList:
 
 
     def _load_cookies(self):
-        if os.path.exists(self._cookie_cache_path()):
+        # Load the Selenium-format cookies.json (list of dicts, as produced by the
+        # client login flow) into the requests cookie jar.
+        path = self._cookie_cache_path()
+        if not os.path.exists(path):
+            return
 
-            with open(self._cookie_cache_path(), 'r') as file:
-                cookies = json.load(file)
+        with open(path, 'r') as file:
+            cookies = json.load(file)
 
-            for cookie in cookies:
-                self.driver.add_cookie(cookie)
+        for cookie in cookies:
+            kwargs = {
+                "domain": cookie.get("domain", ".amazon.com"),
+                "path": cookie.get("path", "/"),
+            }
+            if "secure" in cookie:
+                kwargs["secure"] = bool(cookie["secure"])
+            if isinstance(cookie.get("expiry"), (int, float)):
+                kwargs["expires"] = int(cookie["expiry"])
 
-            self.driver.refresh()
-            self._selenium_wait_element((By.ID, 'nav-link-accountList'))
+            rest = {}
+            if cookie.get("httpOnly"):
+                rest["HttpOnly"] = ""
+            if cookie.get("sameSite"):
+                rest["SameSite"] = cookie["sameSite"]
+            if rest:
+                kwargs["rest"] = rest
+
+            self.session.cookies.set(cookie["name"], cookie["value"], **kwargs)
 
 
-    # ============================================================
-    # Authentication
+    def _serialize_cookies(self):
+        # Convert the requests jar back to the Selenium list-of-dicts shape so the
+        # file format stays compatible with the client login flow.
+        out = []
+        for c in self.session.cookies:
+            cookie = {
+                "name": c.name,
+                "value": c.value,
+                "domain": c.domain,
+                "path": c.path,
+                "secure": bool(c.secure),
+            }
+            if c.expires is not None:
+                cookie["expiry"] = int(c.expires)
+            if c.has_nonstandard_attr("HttpOnly"):
+                cookie["httpOnly"] = True
+            same_site = c.get_nonstandard_attr("SameSite")
+            if same_site:
+                cookie["sameSite"] = same_site
+            out.append(cookie)
+        return out
 
-
-    def requires_login(self):
-        if 'ap/signin' in self.driver.current_url:
-            return True
-
-        if len(self.driver.find_elements(By.CLASS_NAME, 'nav-action-signin-button')) > 0:
-            return True
-
-        if self.is_authenticated == False:
-            return True
-
-        return False
-    
 
     def _save_session_atomic(self, cookies):
         # R2 — write to a temp file then os.replace() onto cookies.json, so a
@@ -174,150 +163,162 @@ class AlexaShoppingList:
         if not force and (now - self._last_cookie_save) < COOKIE_SAVE_THROTTLE_SECONDS:
             return
 
-        # R4 — a read/write failure must never abort the in-flight command or
-        # crash the driver; catch and log it.
+        # R4 — a read/write failure must never abort the in-flight command;
+        # catch and log it.
         try:
-            cookies = self.driver.get_cookies()
+            cookies = self._serialize_cookies()
             self._save_session_atomic(cookies)
             self._last_cookie_save = now
-            print("Saved "+str(len(cookies))+" cookies to "+self._cookie_cache_path())
+            print("Saved " + str(len(cookies)) + " cookies to " + self._cookie_cache_path())
         except Exception as e:
-            print("Failed to persist session cookies: "+str(e))
+            print("Failed to persist session cookies: " + str(e))
+
+    # ============================================================
+    # API request helper
+
+
+    def _api(self, method: str, path: str, body=None):
+        url = self.api_url + path
+        data = json.dumps(body) if body is not None else None
+
+        try:
+            response = self.session.request(
+                method, url, data=data, timeout=REQUEST_TIMEOUT
+            )
+        except requests.RequestException as e:
+            self.is_authenticated = False
+            raise RuntimeError("Alexa API request failed: " + str(e))
+
+        content_type = response.headers.get("content-type", "").lower()
+
+        # A 401/403, or an HTML body served in place of the API, means the session
+        # was rejected or a robot-mitigation interstitial was returned. Treat it as
+        # not-authenticated and raise — server.py turns this into the clean
+        # "please retry" signal and the worker re-polls / prompts a re-login.
+        if response.status_code in (401, 403) or "html" in content_type:
+            self.is_authenticated = False
+            raise RuntimeError(
+                "Alexa session rejected or interstitial served (status "
+                + str(response.status_code) + ")"
+            )
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                "Alexa API " + method + " " + path
+                + " returned " + str(response.status_code)
+            )
+
+        self.is_authenticated = True
+        # Persist the cookies Amazon rotated on this response (R1, throttled).
+        self.save_session()
+        return response
+
+    # ============================================================
+    # List resolution
+
+
+    def _get_all_lists(self):
+        # getlistitems returns every list on the account keyed by list id.
+        return self._api("GET", "/getlistitems").json()
+
+
+    def _default_list(self, data=None):
+        # Pick the Alexa shopping list by listType == SHOPPING_LIST, preferring the
+        # default-flagged one. The id is account-specific, so derive it each run
+        # rather than hardcoding (see the API contract in the hardening doc).
+        data = data if data is not None else self._get_all_lists()
+
+        shopping_lists = []
+        for lid, node in data.items():
+            info = node.get("listInfo", {})
+            if info.get("listType") == "SHOPPING_LIST":
+                shopping_lists.append((info.get("listId", lid), node, info.get("defaultList", False)))
+
+        if not shopping_lists:
+            raise RuntimeError("No Alexa SHOPPING_LIST found in account lists")
+
+        for lid, node, is_default in shopping_lists:
+            if is_default:
+                self._default_list_id = lid
+                return lid, node
+
+        lid, node, _ = shopping_lists[0]
+        self._default_list_id = lid
+        return lid, node
+
+
+    def _find_item(self, value: str, data=None):
+        # Return the full item object as getlistitems returned it (delete/update
+        # need to echo it back verbatim), or None if not present.
+        _, node = self._default_list(data)
+        for item in node.get("listItems", []):
+            if item.get("value") == value:
+                return item
+        return None
+
+    # ============================================================
+    # Authentication
+
+
+    def requires_login(self):
+        # A single getlistitems call doubles as the auth probe: success => the
+        # cookies are still good; any failure => re-login required.
+        try:
+            self._get_all_lists()
+            return not self.is_authenticated
+        except Exception:
+            return True
 
     # ============================================================
     # Alexa lists
 
 
-    def _ensure_driver_is_on_alexa_list(self, refresh: bool = False):
-        list_url = "https://www."+self.amazon_url+"/alexaquantum/sp/alexaShoppingList?ref=nav_asl"
-        if self.driver.current_url != list_url:
-            self._selenium_get(list_url, (By.CLASS_NAME, 'virtual-list'))
-        elif refresh == True:
-            self.driver.refresh()
-            self._selenium_wait_element((By.CLASS_NAME, 'virtual-list'))
-
-
     def get_alexa_list(self, refresh: bool = True):
-        self._ensure_driver_is_on_alexa_list(refresh)
-        time.sleep(5)
-
-        list_container = self.driver.find_element(By.CLASS_NAME, 'virtual-list')
-
-        found = []
-        last = None
-        while True:
-            list_items = list_container.find_elements(By.CLASS_NAME, 'item-title')
-            for item in list_items:
-                if item.get_attribute('innerText') not in found:
-                    found.append(item.get_attribute('innerText'))
-            if not list_items or last == list_items[-1]:
-                # We've reached the end
-                break
-            last = list_items[-1]
-            self.driver.execute_script("arguments[0].scrollIntoView();", last)
-            time.sleep(1)
-
-        if not refresh:
-            # Now let's scroll back to the top
-            first = None
-            while True:
-                list_items = list_container.find_elements(By.CLASS_NAME, 'item-title')
-                if not list_items or first == list_items[0]:
-                    # We've reached the top
-                    break
-                first = list_items[0]
-                scroll_origin = ScrollOrigin.from_element(first)
-                ActionChains(self.driver).scroll_from_origin(scroll_origin, 0, -1000).perform()
-
-        # R1 — persist the rotated cookies after navigating/refreshing the list.
-        # add/update/remove all funnel through here, so this covers every command.
-        self.save_session()
-
-        return found
-
-
-    def _get_alexa_list_item_element(self, item: str):
-        self._ensure_driver_is_on_alexa_list(False)
-        time.sleep(5)
-        list_container = self.driver.find_element(By.CLASS_NAME, 'virtual-list')
-
-        last = None
-        while True:
-            list_items = list_container.find_elements(By.CLASS_NAME, 'inner')
-            for container in list_items:
-                title_element = container.find_element(By.CLASS_NAME, 'item-title')
-                if title_element.get_attribute('innerText') == item:
-                    return container  # Return immediately when found
-
-            if not list_items or last == list_items[-1]:
-                # We've reached the top
-                break
-
-            last = list_items[-1]
-            self.driver.execute_script("arguments[0].scrollIntoView();", last)
-            time.sleep(1)
-
-        return None
+        # refresh is kept for signature parity; the JSON read is always live.
+        data = self._get_all_lists()
+        _, node = self._default_list(data)
+        # Match the old scraper: active (incomplete) items only. The JSON also
+        # exposes `completed`, so check-off support could be added later.
+        return [
+            item["value"]
+            for item in node.get("listItems", [])
+            if not item.get("completed")
+        ]
 
 
     def add_alexa_list_item(self, item: str):
-        element = self._get_alexa_list_item_element(item)
-        if element != None:
+        # Idempotent, like the old scraper: if it's already on the list, do nothing.
+        if self._find_item(item) is not None:
             return
 
-        self.driver.find_element(By.CLASS_NAME, 'list-header').find_element(By.CLASS_NAME, 'add-symbol').click()
-
-        textfield = self.driver.find_element(By.CLASS_NAME, 'list-header').find_element(By.CLASS_NAME, 'input-box').find_element(By.TAG_NAME, 'input')
-        textfield.send_keys(item)
-
-        submit = self.driver.find_element(By.CLASS_NAME, 'list-header').find_element(By.CLASS_NAME, 'add-to-list').find_element(By.TAG_NAME, 'button')
-        submit.click()
-
-        self.driver.find_element(By.CLASS_NAME, 'list-header').find_element(By.CLASS_NAME, 'cancel-input').click()
-        time.sleep(1)
-
-        return self.get_alexa_list(False)
+        list_id = self._default_list_id or self._default_list()[0]
+        self._api(
+            "POST", "/addlistitem/" + list_id,
+            {"value": item, "listItemMetadata": []}
+        )
+        return self.get_alexa_list()
 
 
     def update_alexa_list_item(self, old: str, new: str):
-        element = self._get_alexa_list_item_element(old)
-        if element == None:
+        existing = self._find_item(old)
+        if existing is None:
             return
 
-        element.find_element(By.CLASS_NAME, 'item-actions-1').find_element(By.TAG_NAME, 'button').click()
-
-        textfield = element.find_element(By.CLASS_NAME, 'input-box').find_element(By.TAG_NAME, 'input')
-        textfield.clear()
-        textfield.send_keys(new)
-
-        element.find_element(By.CLASS_NAME, 'item-actions-2').find_element(By.TAG_NAME, 'button').click()
-        time.sleep(1)
-
-        return self.get_alexa_list(False)
+        # PUT, not POST (POST -> 405). Full item object + new value + mergedListId.
+        body = dict(existing, value=new, mergedListId=existing["listId"])
+        self._api("PUT", "/updatelistitem", body)
+        return self.get_alexa_list()
 
 
     def remove_alexa_list_item(self, item: str):
-        # In large lists, items towards the end are sometimes not found on the first try
-        # In cases like these, retry if the element is not found
-        retries = 3
-        while retries > 0:
-            element = self._get_alexa_list_item_element(item)
-            
-            if element is None:
-                return None
-            
-            try:
-                # Find the delete button and click it
-                delete_button = element.find_element(By.CLASS_NAME, 'item-actions-2').find_element(By.TAG_NAME, 'button')
-                delete_button.click()
-                break
-            except StaleElementReferenceException:
-                retries -= 1
-                time.sleep(1)
-            except Exception as e:
-                return None
-        
-        time.sleep(1)  # Wait for the list to update
-        return self.get_alexa_list(False)
+        existing = self._find_item(item)
+        if existing is None:
+            return None
+
+        # The full item object is required (a minimal body -> 400); echo it back
+        # exactly as getlistitems returned it, plus mergedListId.
+        body = dict(existing, mergedListId=existing["listId"])
+        self._api("DELETE", "/deletelistitem", body)
+        return self.get_alexa_list()
 
     # ============================================================

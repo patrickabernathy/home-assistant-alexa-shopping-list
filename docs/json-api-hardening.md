@@ -1,6 +1,10 @@
 # Hardening the fork: from DOM scraping to the Alexa list JSON API
 
-**Status:** discovery spike complete — full CRUD contract confirmed · implementation not started
+**Status:** Phase 2 shipped — `server/alexa.py` rewritten to the JSON API via
+`requests`; Selenium removed from the server hot path. Server container still
+ships Chromium as a no-longer-used fallback (clean-up is a follow-up). Write verbs
+not yet exercised from Python against the live account (reads proven) — see
+"Remaining unknowns".
 **Spike date:** 2026-07-22
 **Author:** Patrick + Claude Code (Playwright spike against the live logged-in session)
 
