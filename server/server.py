@@ -84,8 +84,12 @@ def _start_alexa():
     global alexa_running
 
     if alexa_running == False:
+        # Force amazon.com regardless of any stored config value. This is a
+        # personal US fork: a co.uk (or other regional) URL silently breaks the
+        # Alexa shopping-list flow, and honoring the configurable value cost real
+        # debugging time. Hardcoding removes that whole class of misconfiguration.
         alexa = AlexaShoppingList(
-            _get_config_value("amazon_url", "amazon.com"),
+            "amazon.com",
             _config_path()
         )
         alexa_running = True
