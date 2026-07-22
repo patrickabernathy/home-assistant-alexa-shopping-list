@@ -14,11 +14,16 @@ import os
 
 WAIT_TIMEOUT=30
 
+# Persist rotated session cookies at most once per this many seconds (R3).
+# The worker polls ~every 90s, so this is naturally ~1 write per cycle.
+COOKIE_SAVE_THROTTLE_SECONDS=60
+
 class AlexaShoppingList:
 
-    def __init__(self, amazon_url: str = "amazon.co.uk", cookies_path: str = ""):
+    def __init__(self, amazon_url: str = "amazon.com", cookies_path: str = ""):
         self.amazon_url = amazon_url
         self.cookies_path = cookies_path
+        self._last_cookie_save = 0
         self._setup_driver()
 
 
@@ -79,7 +84,9 @@ class AlexaShoppingList:
 
     def _clear_driver(self):
         if hasattr(self, "driver"):
-            self.save_session()
+            # Force a final persist on teardown, bypassing the throttle, so the
+            # freshest rotation is never lost on a clean shutdown.
+            self.save_session(force=True)
             self.driver.close()
 
 
@@ -139,10 +146,38 @@ class AlexaShoppingList:
         return False
     
 
-    def save_session(self):
-        if self.is_authenticated:
-            with open(self._cookie_cache_path(), 'w') as file:
-                json.dump(self.driver.get_cookies(), file)
+    def _save_session_atomic(self, cookies):
+        # R2 — write to a temp file then os.replace() onto cookies.json, so a
+        # crash mid-write can never corrupt the persisted session.
+        path = self._cookie_cache_path()
+        tmp_path = path + ".tmp"
+        with open(tmp_path, 'w') as file:
+            json.dump(cookies, file)
+        os.replace(tmp_path, path)
+
+
+    def save_session(self, force: bool = False):
+        # Persist the session cookies Amazon rotates on each authenticated
+        # request. Called after every list operation (R1) so the freshest
+        # rotation survives an unclean container/Chrome restart — not just a
+        # clean shutdown.
+        if not self.is_authenticated:
+            return
+
+        now = time.time()
+        # R3 — throttle: at most one write per COOKIE_SAVE_THROTTLE_SECONDS.
+        if not force and (now - self._last_cookie_save) < COOKIE_SAVE_THROTTLE_SECONDS:
+            return
+
+        # R4 — a read/write failure must never abort the in-flight command or
+        # crash the driver; catch and log it.
+        try:
+            cookies = self.driver.get_cookies()
+            self._save_session_atomic(cookies)
+            self._last_cookie_save = now
+            print("Saved "+str(len(cookies))+" cookies to "+self._cookie_cache_path())
+        except Exception as e:
+            print("Failed to persist session cookies: "+str(e))
 
     # ============================================================
     # Alexa lists
@@ -188,6 +223,10 @@ class AlexaShoppingList:
                 first = list_items[0]
                 scroll_origin = ScrollOrigin.from_element(first)
                 ActionChains(self.driver).scroll_from_origin(scroll_origin, 0, -1000).perform()
+
+        # R1 — persist the rotated cookies after navigating/refreshing the list.
+        # add/update/remove all funnel through here, so this covers every command.
+        self.save_session()
 
         return found
 

@@ -101,7 +101,7 @@ class WebSocketClient:
     
 
     async def _setup_server_config(self):
-        amazon_url = input("\nEnter the base url you use to access Amazon (amazon.co.uk): ")
+        amazon_url = input("\nEnter the base url you use to access Amazon (amazon.com): ")
         amazon_url = amazon_url.replace("https://", "")
         amazon_url = amazon_url.replace("http://", "")
         amazon_url = amazon_url.replace("www.", "")
@@ -109,7 +109,7 @@ class WebSocketClient:
         amazon_url = amazon_url.lower()
 
         if amazon_url == "":
-            amazon_url = "amazon.co.uk"
+            amazon_url = "amazon.com"
 
         await self._cmd_config_set("amazon_url", amazon_url, False)
     
@@ -122,7 +122,7 @@ class WebSocketClient:
     
 
     async def _setup_server_authentication(self):
-        amazon_url = await self._cmd_config_get("amazon_url", "amazon.co.uk")
+        amazon_url = await self._cmd_config_get("amazon_url", "amazon.com")
 
         authenticator = Authenticator(amazon_url)
         session = authenticator.run()
