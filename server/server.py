@@ -85,7 +85,7 @@ def _start_alexa():
 
     if alexa_running == False:
         alexa = AlexaShoppingList(
-            _get_config_value("amazon_url", "amazon.co.uk"),
+            _get_config_value("amazon_url", "amazon.com"),
             _config_path()
         )
         alexa_running = True

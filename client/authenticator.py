@@ -50,7 +50,7 @@ OS_SETTINGS = {
 
 class Authenticator:
 
-    def __init__(self, amazon_url: str = "amazon.co.uk"):
+    def __init__(self, amazon_url: str = "amazon.com"):
         self.amazon_url = amazon_url
 
 
