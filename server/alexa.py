@@ -87,7 +87,12 @@ class AlexaShoppingList:
             # Force a final persist on teardown, bypassing the throttle, so the
             # freshest rotation is never lost on a clean shutdown.
             self.save_session(force=True)
-            self.driver.close()
+            # A crashed/half-built driver can raise on close; swallow it so
+            # teardown never adds noise to an already-failing command.
+            try:
+                self.driver.close()
+            except Exception:
+                pass
 
 
     def _selenium_wait_element(self, element: tuple):
@@ -161,7 +166,7 @@ class AlexaShoppingList:
         # request. Called after every list operation (R1) so the freshest
         # rotation survives an unclean container/Chrome restart — not just a
         # clean shutdown.
-        if not self.is_authenticated:
+        if not getattr(self, "is_authenticated", False):
             return
 
         now = time.time()

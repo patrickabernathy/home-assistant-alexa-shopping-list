@@ -234,33 +234,44 @@ async def _route_command(command, arguments={}):
 
 async def _process_command(websocket, path):
     clients.add(websocket)
-    # try:
-    async for message in websocket:
-        # try:
+    try:
+        async for message in websocket:
+            response = {"result": None, "error": None}
+            command = None
 
-        data = json.loads(message)
-        command = data.get('command')
-        arguments = data.get('args')
+            try:
+                data = json.loads(message)
+                command = data.get('command')
+                arguments = data.get('args')
 
-        response = {"result": None, "error": None}
-        results = await _route_command(command, arguments)
+                results = await _route_command(command, arguments)
 
-        if results is not None and len(results) == 2:
-            response = {
-                "result": results[0],
-                "error": results[1]
-            }
-        else:
-            response['error'] = 'Unknown command'
+                if results is not None and len(results) == 2:
+                    response = {
+                        "result": results[0],
+                        "error": results[1]
+                    }
+                else:
+                    response['error'] = 'Unknown command'
 
-        # except json.JSONDecodeError:
-        #     response = {'error': 'Invalid JSON'}
-        # except:
-        #     response = {'error': 'Fatal exception'}
+            except json.JSONDecodeError:
+                response = {"result": None, "error": "Invalid JSON"}
+            except Exception as e:
+                # A transient Selenium/Chrome failure — e.g. a cold-start crash on
+                # the first request right after a restart — must not take down the
+                # connection with a giant traceback. Log one concise line, reset
+                # the driver, and return a clean "starting" error so the worker
+                # just retries on its next pulse.
+                print("Command '"+str(command)+"' failed, returning retryable error: "+repr(e))
+                _stop_alexa()
+                response = {
+                    "result": None,
+                    "error": "Bridge starting or busy, please retry"
+                }
 
-        await websocket.send(json.dumps(response))
-    # finally:
-    clients.remove(websocket)
+            await websocket.send(json.dumps(response))
+    finally:
+        clients.discard(websocket)
 
 # ============================================================
 # Start/Stop
