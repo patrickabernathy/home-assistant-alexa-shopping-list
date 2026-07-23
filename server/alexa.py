@@ -21,7 +21,10 @@
 import requests
 import time
 import json
+import logging
 import os
+
+logger = logging.getLogger("asl.alexa")
 
 # Per-request network timeout (seconds).
 REQUEST_TIMEOUT = 30
@@ -33,6 +36,12 @@ COOKIE_SAVE_THROTTLE_SECONDS = 60
 # Present a browser-like UA rather than the default python-requests one, matching
 # the User-Agent the old Selenium scraper used, to stay clear of robot mitigation.
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+
+class NotAuthenticatedError(RuntimeError):
+    # The session cookies were rejected (401/403) or an interstitial was served.
+    # A human re-login through the client is required; retrying won't help.
+    pass
 
 
 class AlexaShoppingList:
@@ -95,6 +104,8 @@ class AlexaShoppingList:
 
         with open(path, 'r') as file:
             cookies = json.load(file)
+
+        logger.info("Loaded %d cookies from %s", len(cookies), path)
 
         for cookie in cookies:
             kwargs = {
@@ -169,9 +180,9 @@ class AlexaShoppingList:
             cookies = self._serialize_cookies()
             self._save_session_atomic(cookies)
             self._last_cookie_save = now
-            print("Saved " + str(len(cookies)) + " cookies to " + self._cookie_cache_path())
+            logger.info("Saved %d cookies to %s", len(cookies), self._cookie_cache_path())
         except Exception as e:
-            print("Failed to persist session cookies: " + str(e))
+            logger.error("Failed to persist session cookies: %s", e)
 
     # ============================================================
     # API request helper
@@ -187,7 +198,10 @@ class AlexaShoppingList:
             )
         except requests.RequestException as e:
             self.is_authenticated = False
+            logger.warning("Alexa API %s %s failed: %s", method, path, e)
             raise RuntimeError("Alexa API request failed: " + str(e))
+
+        logger.debug("Alexa API %s %s -> %d", method, path, response.status_code)
 
         content_type = response.headers.get("content-type", "").lower()
 
@@ -197,7 +211,11 @@ class AlexaShoppingList:
         # "please retry" signal and the worker re-polls / prompts a re-login.
         if response.status_code in (401, 403) or "html" in content_type:
             self.is_authenticated = False
-            raise RuntimeError(
+            logger.warning(
+                "Alexa API %s %s rejected (status %d, content-type %s)",
+                method, path, response.status_code, content_type
+            )
+            raise NotAuthenticatedError(
                 "Alexa session rejected or interstitial served (status "
                 + str(response.status_code) + ")"
             )
@@ -256,6 +274,16 @@ class AlexaShoppingList:
                 return item
         return None
 
+
+    def _active_items(self, node):
+        # Match the old scraper: active (incomplete) items only. The JSON also
+        # exposes `completed`, so check-off support could be added later.
+        return [
+            item["value"]
+            for item in node.get("listItems", [])
+            if not item.get("completed")
+        ]
+
     # ============================================================
     # Authentication
 
@@ -277,21 +305,19 @@ class AlexaShoppingList:
         # refresh is kept for signature parity; the JSON read is always live.
         data = self._get_all_lists()
         _, node = self._default_list(data)
-        # Match the old scraper: active (incomplete) items only. The JSON also
-        # exposes `completed`, so check-off support could be added later.
-        return [
-            item["value"]
-            for item in node.get("listItems", [])
-            if not item.get("completed")
-        ]
+        return self._active_items(node)
 
 
     def add_alexa_list_item(self, item: str):
-        # Idempotent, like the old scraper: if it's already on the list, do nothing.
-        if self._find_item(item) is not None:
-            return
+        # One getlistitems serves both the idempotency check and the no-op return;
+        # only a real change costs a second read (which also verifies the write).
+        data = self._get_all_lists()
+        list_id, node = self._default_list(data)
 
-        list_id = self._default_list_id or self._default_list()[0]
+        # Idempotent, like the old scraper: if it's already on the list, do nothing.
+        if self._find_item(item, data) is not None:
+            return self._active_items(node)
+
         self._api(
             "POST", "/addlistitem/" + list_id,
             {"value": item, "listItemMetadata": []}
@@ -300,9 +326,12 @@ class AlexaShoppingList:
 
 
     def update_alexa_list_item(self, old: str, new: str):
-        existing = self._find_item(old)
+        data = self._get_all_lists()
+        _, node = self._default_list(data)
+
+        existing = self._find_item(old, data)
         if existing is None:
-            return
+            return self._active_items(node)
 
         # PUT, not POST (POST -> 405). Full item object + new value + mergedListId.
         body = dict(existing, value=new, mergedListId=existing["listId"])
@@ -311,9 +340,12 @@ class AlexaShoppingList:
 
 
     def remove_alexa_list_item(self, item: str):
-        existing = self._find_item(item)
+        data = self._get_all_lists()
+        _, node = self._default_list(data)
+
+        existing = self._find_item(item, data)
         if existing is None:
-            return None
+            return self._active_items(node)
 
         # The full item object is required (a minimal body -> 400); echo it back
         # exactly as getlistitems returned it, plus mergedListId.

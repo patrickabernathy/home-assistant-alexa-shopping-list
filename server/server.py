@@ -3,15 +3,20 @@
 import asyncio
 import websockets
 import json
+import logging
 import signal
 import os
-from alexa import AlexaShoppingList
+from alexa import AlexaShoppingList, NotAuthenticatedError
 import time
+
+logger = logging.getLogger("asl.server")
 
 clients = set()
 
-alexa_running = False
 alexa = None
+# All commands that touch the shared Alexa instance / cookies.json serialize on
+# this lock, so concurrent clients can't interleave operations.
+alexa_lock = asyncio.Lock()
 
 # ============================================================
 # Helpers
@@ -52,12 +57,12 @@ def _get_config_value(key, default=None):
 
 
 def _set_config_value(key, new_value=None):
-    print("\nSet config value `"+key+"` = "+str(new_value))
+    logger.info("Set config value `%s` = %s", key, new_value)
     global config
     if new_value != None:
         config[key] = new_value
     else:
-        del config[key]
+        config.pop(key, None)
     _save_config()
 
 
@@ -80,10 +85,12 @@ async def _cmd_config_get(args):
 
 
 def _start_alexa():
+    # The instance is long-lived: with requests (unlike the old crash-prone
+    # Chrome) there is no reason to tear it down per command, and reusing it
+    # avoids re-reading cookies.json on every operation.
     global alexa
-    global alexa_running
 
-    if alexa_running == False:
+    if alexa is None:
         # Force amazon.com regardless of any stored config value. This is a
         # personal US fork: a co.uk (or other regional) URL silently breaks the
         # Alexa shopping-list flow, and honoring the configurable value cost real
@@ -92,32 +99,36 @@ def _start_alexa():
             "amazon.com",
             _config_path()
         )
-        alexa_running = True
-    
+
     return alexa
 
 
 def _stop_alexa():
+    # Drop the instance. Deleting it triggers a final forced cookie save
+    # (alexa.__del__); the next _start_alexa() re-reads cookies.json, so this is
+    # also how new cookies (login) or a cleared session (reset) get picked up.
     global alexa
-    global alexa_running
 
-    if alexa_running == True:
+    if alexa is not None:
         del alexa
-    
+
     alexa = None
-    alexa_running = False
 
 # ============================================================
 # API
 
 
 async def _cmd_reset():
+    # Stop first: the instance's teardown force-saves cookies, which would
+    # otherwise resurrect cookies.json right after we delete it.
+    _stop_alexa()
+
     purge_files = ['config.json', 'cookies.json']
     for filename in purge_files:
         file_path = os.path.join(_config_path(), filename)
         if os.path.exists(file_path):
             os.remove(file_path)
-    
+
     _load_config()
     return True, None
 
@@ -127,69 +138,61 @@ async def _cmd_is_authenticated():
     time_diff = _time_now() - recent
 
     if time_diff < 86400:
+        logger.debug("Authenticated: Yes (cached, checked %ds ago)", time_diff)
         return True, None
 
     instance = _start_alexa()
 
-    if instance.requires_login() == True:
-        print("\nAuthenticated: No")
-        result = False, None
-    else:
-        print("\nAuthenticated: Yes")
-        _set_config_value("auth_checked_time", _time_now())
-        result = True, None
-    
-    _stop_alexa()
-    return result
+    if await asyncio.to_thread(instance.requires_login) == True:
+        logger.warning("Authenticated: No (live probe)")
+        # Drop the instance so a subsequent login's cookies.json is re-read.
+        _stop_alexa()
+        return False, None
+
+    logger.info("Authenticated: Yes (live probe)")
+    _set_config_value("auth_checked_time", _time_now())
+    return True, None
 
 
 async def _cmd_login(args):
-    print("\nAttempting login...")
+    logger.info("Attempting login with %d received cookies", len(args.get('session') or []))
+
+    # Drop the current instance (and its in-memory jar) before writing the new
+    # cookies, then invalidate the 24h cache so the check below probes live.
+    _stop_alexa()
 
     with open(os.path.join(_config_path(), 'cookies.json'), 'w') as file:
         json.dump(args['session'], file)
 
+    _set_config_value('auth_checked_time', None)
     return await _cmd_is_authenticated()
 
 
+# The list commands run without a pre-flight requires_login() probe: that probe
+# was a full getlistitems round-trip before every operation. A dead session now
+# surfaces as NotAuthenticatedError from the operation itself, which the message
+# handler turns into the same "Not authenticated" error the probe produced.
+# The blocking requests calls run in a thread so the event loop (ping, other
+# clients) stays responsive.
+
 async def _cmd_get_shopping_list():
     instance = _start_alexa()
-    if instance.requires_login():
-        result =  None, "Not authenticated"
-    else:
-        result = instance.get_alexa_list(), None
-    _stop_alexa()
-    return result
+    return await asyncio.to_thread(instance.get_alexa_list), None
 
 
 async def _cmd_get_add_shopping_list_item(args):
     instance = _start_alexa()
-    if instance.requires_login():
-        result =  None, "Not authenticated"
-    else:
-        result = instance.add_alexa_list_item(args['item']), None
-    _stop_alexa()
-    return result
+    return await asyncio.to_thread(instance.add_alexa_list_item, args['item']), None
 
 
 async def _cmd_get_update_shopping_list_item(args):
     instance = _start_alexa()
-    if instance.requires_login():
-        result =  None, "Not authenticated"
-    else:
-        result = instance.update_alexa_list_item(args['old'], args['new']), None
-    _stop_alexa()
-    return result
+    return await asyncio.to_thread(instance.update_alexa_list_item, args['old'], args['new']), None
 
 
 async def _cmd_get_remove_shopping_list_item(args):
     instance = _start_alexa()
-    if instance.requires_login():
-        result =  None, "Not authenticated"
-    else:
-        result = instance.remove_alexa_list_item(args['item']), None
-    _stop_alexa()
-    return result
+    return await asyncio.to_thread(instance.remove_alexa_list_item, args['item']), None
 
 # ============================================================
 # Main handler
@@ -204,40 +207,82 @@ async def _route_command(command, arguments={}):
         return await _cmd_config_set(arguments)
     if command == "config_get":
         return await _cmd_config_get(arguments)
-    if command == "reset":
-        return await _cmd_reset()
-    
-    # Authentication
-    if command == "authenticated":
-        return await _cmd_is_authenticated()
-    if command == "login":
-        return await _cmd_login(arguments)
-    if command == "mfa":
-        return await _cmd_mfa(arguments)
-    
-    # Shopping list
-    if command == "get_list":
-        return await _cmd_get_shopping_list()
-    if command == "add_item":
-        return await _cmd_get_add_shopping_list_item(arguments)
-    if command == "update_item":
-        return await _cmd_get_update_shopping_list_item(arguments)
-    if command == "remove_item":
-        return await _cmd_get_remove_shopping_list_item(arguments)
-    
-    # Misc
+
+    # Misc — kept outside the lock so ping stays responsive mid-operation.
     if command == "ping":
         return "pong", None
     if command == "shutdown":
-        await _shutdown_server()
+        # Schedule the shutdown so this response still reaches the client.
+        asyncio.create_task(_shutdown_server())
+        return True, None
+
+    # Everything below touches the shared Alexa instance / cookies.json.
+    async with alexa_lock:
+        # Authentication
+        if command == "authenticated":
+            return await _cmd_is_authenticated()
+        if command == "login":
+            return await _cmd_login(arguments)
+        if command == "reset":
+            return await _cmd_reset()
+
+        # Shopping list
+        if command == "get_list":
+            return await _cmd_get_shopping_list()
+        if command == "add_item":
+            return await _cmd_get_add_shopping_list_item(arguments)
+        if command == "update_item":
+            return await _cmd_get_update_shopping_list_item(arguments)
+        if command == "remove_item":
+            return await _cmd_get_remove_shopping_list_item(arguments)
+
+
+def _peer_name(websocket):
+    addr = getattr(websocket, "remote_address", None)
+    if isinstance(addr, tuple) and len(addr) >= 2:
+        return str(addr[0]) + ":" + str(addr[1])
+    return "unknown"
+
+
+def _describe_args(command, arguments):
+    # One-line argument summary. Never dump login args — they are the session
+    # cookies.
+    if not arguments:
+        return ""
+    if command == "login":
+        return " (session redacted)"
+    return " " + json.dumps(arguments)
+
+
+def _describe_result(result):
+    # Lists get logged in full so what each caller (grocery-sync worker, HA
+    # integration, CLI) was actually served can be compared across log lines.
+    if isinstance(result, list):
+        return str(len(result)) + " items " + json.dumps(result)
+    return json.dumps(result)
+
+
+def _log_command(peer, command, arguments, response):
+    if command == "ping":
+        logger.debug("%s ping", peer)
+        return
+
+    summary = command + _describe_args(command, arguments)
+    if response.get("error"):
+        logger.warning("%s %s -> error: %s", peer, summary, response["error"])
+    else:
+        logger.info("%s %s -> %s", peer, summary, _describe_result(response.get("result")))
 
 
 async def _process_command(websocket, path):
+    peer = _peer_name(websocket)
     clients.add(websocket)
+    logger.debug("%s connected", peer)
     try:
         async for message in websocket:
             response = {"result": None, "error": None}
             command = None
+            arguments = None
 
             try:
                 data = json.loads(message)
@@ -256,40 +301,69 @@ async def _process_command(websocket, path):
 
             except json.JSONDecodeError:
                 response = {"result": None, "error": "Invalid JSON"}
+            except NotAuthenticatedError as e:
+                # The session cookies were rejected mid-operation. Return the same
+                # "Not authenticated" error the old pre-flight probe produced (the
+                # grocery-sync worker keys off it), and invalidate the 24h auth
+                # cache so the worker's next `authenticated` poll goes false
+                # immediately instead of reading the stale cached yes.
+                logger.warning("Command '%s' rejected by Amazon: %r", command, e)
+                _set_config_value('auth_checked_time', None)
+                _stop_alexa()
+                response = {"result": None, "error": "Not authenticated"}
             except Exception as e:
-                # A transient Selenium/Chrome failure — e.g. a cold-start crash on
-                # the first request right after a restart — must not take down the
-                # connection with a giant traceback. Log one concise line, reset
-                # the driver, and return a clean "starting" error so the worker
-                # just retries on its next pulse.
-                print("Command '"+str(command)+"' failed, returning retryable error: "+repr(e))
+                # A transient failure — e.g. a network blip against the Amazon
+                # API — must not take down the connection with a giant traceback.
+                # Log one concise line, reset the instance, and return a clean
+                # "busy" error so the worker just retries on its next pulse.
+                logger.warning("Command '%s' failed, returning retryable error: %r", command, e)
                 _stop_alexa()
                 response = {
                     "result": None,
                     "error": "Bridge starting or busy, please retry"
                 }
 
+            _log_command(peer, command, arguments, response)
             await websocket.send(json.dumps(response))
     finally:
         clients.discard(websocket)
+        logger.debug("%s disconnected", peer)
 
 # ============================================================
 # Start/Stop
 
 
 async def _shutdown_server():
-    for ws in clients:
+    # Force a final cookie save so the freshest rotation survives the restart.
+    _stop_alexa()
+    for ws in list(clients):
         await ws.close()
     server.close()
     await server.wait_closed()
 
 
-def _signal_handler(sig, frame):
-    print("\nShutting down server...")
-    asyncio.run(_shutdown_server())
+def _handle_stop_signal():
+    logger.info("Shutting down server...")
+    asyncio.create_task(_shutdown_server())
+
+
+def _setup_logging():
+    # INFO gives one line per command (heartbeat + served payloads); set
+    # ASL_LOG_LEVEL=DEBUG for pings, connections and raw Amazon API calls.
+    # The env level is applied to the app's `asl` namespace only — putting the
+    # root logger at DEBUG would also unleash frame-level spam from the
+    # websockets/urllib3 libraries.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logging.getLogger("asl").setLevel(
+        os.environ.get("ASL_LOG_LEVEL", "INFO").upper()
+    )
 
 
 async def main():
+    _setup_logging()
     _load_config()
 
     global server
@@ -297,9 +371,20 @@ async def main():
     listen_port = int(_get_config_value('listen_port', 4000))
     server = await websockets.serve(_process_command, listen_addr, listen_port)
 
-    print("Alexa Shopping List server started on port "+str(listen_port))
+    logger.info("Alexa Shopping List server started on port %d", listen_port)
 
-    signal.signal(signal.SIGINT, _signal_handler)
+    # SIGTERM is what `docker stop` sends; SIGINT covers Ctrl-C. Registered on
+    # the running loop (the old sync handler called asyncio.run() inside the
+    # running loop, which raises RuntimeError and never shut anything down).
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _handle_stop_signal)
+        except NotImplementedError:
+            # Windows (dev only): no loop signal handlers; the sync fallback
+            # still runs on the main thread, where the loop is running.
+            signal.signal(sig, lambda s, f: _handle_stop_signal())
+
     await server.wait_closed()
 
 # ============================================================

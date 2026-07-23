@@ -185,6 +185,9 @@ class AlexaShoppingListSync:
 
 
     async def _do_sync(self, logger=None, force=False):
+        # NB: `loop` must be resolved here — the old code read a `loop` name that
+        # only existed as a local inside sync(), so every sync died with NameError.
+        loop = asyncio.get_running_loop()
 
         ha_list = await loop.run_in_executor(None, self._read_ha_shopping_list)
         original_ha_list_hash = await loop.run_in_executor(None, self._ha_shopping_list_hash)
@@ -198,10 +201,13 @@ class AlexaShoppingListSync:
 
         for item in ha_list:
             if item['complete'] == True:
+                # Completed: take it off Alexa if present. It must NOT fall
+                # through to the add branch — a completed item Alexa doesn't
+                # have would get re-added (and then resurrected in HA by the
+                # export below).
                 if item['name'] in alexa_list:
                     to_remove.append(item['name'])
-                
-            if item['name'] not in alexa_list:
+            elif item['name'] not in alexa_list:
                 to_add.append(item['name'])
         
         await self._debug_log_entry(logger, "To add to alexa: "+json.dumps(to_add))
@@ -244,11 +250,14 @@ class AlexaShoppingListSync:
             return False
         self._is_syncing = True
 
+        result = False
         try:
             result = await self._do_sync(logger, force)
         except Exception as e:
-            await self._debug_log_entry(logger, type(e))
-            await self._debug_log_entry(logger, e)
+            # Log at error level — debug-only logging kept real failures
+            # invisible at HA's default log level.
+            if logger is not None:
+                logger.error("Alexa Shopping List sync failed: %s", e, exc_info=True)
         finally:
             self._is_syncing = False
 

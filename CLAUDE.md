@@ -25,10 +25,11 @@ Three independent parts, each in its own directory:
   packaged as a Docker image. Runs on the HA host or another LAN machine. This is
   where almost all logic lives.
   - `server.py` — WebSocket server + command router (`ping`, `authenticated`,
-    `login`, `mfa`, `get_list`, `add_item`, `update_item`, `remove_item`,
-    `config_*`, `reset`, `shutdown`). Each command spins up an `AlexaShoppingList`,
-    runs, and tears it down. Config persists to `config.json` under
-    `ASL_CONFIG_PATH`.
+    `login`, `get_list`, `add_item`, `update_item`, `remove_item`,
+    `config_*`, `reset`, `shutdown`). A single long-lived `AlexaShoppingList`
+    serves all commands (serialized on an asyncio lock, blocking HTTP pushed to a
+    thread); it is only torn down/rebuilt on login/reset/error so cookies.json is
+    re-read. Config persists to `config.json` under `ASL_CONFIG_PATH`.
   - `alexa.py` — the `AlexaShoppingList` JSON-API client (Phase 2 of
     `docs/json-api-hardening.md`): a `requests.Session` that loads the persisted
     cookies and reads/adds/updates/removes items via the
@@ -64,20 +65,19 @@ Three independent parts, each in its own directory:
 
 ## Stack & conventions
 
-- **Python 3** throughout. Deps pinned in `server/requirements.txt` and
-  `client/requirements.txt`: `selenium==4.23.1`, `websockets==13.0.1`,
-  `requests==2.32.3`. The server's list operations now run on `requests`;
-  `selenium` stays pinned for the client login flow and as a vestigial fallback in
-  the server image (a clean-up follow-up per `docs/json-api-hardening.md`). No
-  package manager beyond `pip`.
-- **Server container** (`server/Dockerfile`): Alpine + Chromium +
-  chromium-chromedriver (retained for login/fallback; not used by the JSON-API hot
-  path). Env: `ASL_CONFIG_PATH=/config/`, `CHROME_DRIVER=/usr/bin/chromedriver`.
-  Exposes port 4000.
+- **Python 3** throughout. Deps pinned per component: `server/requirements.txt`
+  has `websockets==13.0.1` + `requests==2.32.3` (no Selenium — the server is
+  JSON-API only); `client/requirements.txt` keeps `selenium==4.23.1` for the
+  real-browser login flow. No package manager beyond `pip`.
+- **Server container** (`server/Dockerfile`): Alpine 3.20 + Python only (Chromium
+  was dropped when Selenium left the server). Env: `ASL_CONFIG_PATH=/config/`,
+  `PYTHONUNBUFFERED=1`. Exposes port 4000; TCP healthcheck against it.
 - No test suite or linter is configured. Validate Python changes with
   `python -m py_compile <files>`.
 - Code style matches the surrounding files — plain stdlib, no type-checking
-  tooling, print-based logging.
+  tooling. The server logs via stdlib `logging` (`ASL_LOG_LEVEL` env, default
+  INFO: one line per served command incl. list payloads; DEBUG adds pings,
+  connections and raw Amazon API calls). The client CLI prints.
 
 ## Git conventions
 
