@@ -360,6 +360,10 @@ def _setup_logging():
     logging.getLogger("asl").setLevel(
         os.environ.get("ASL_LOG_LEVEL", "INFO").upper()
     )
+    # The websockets library logs every connection open/close (and every
+    # healthcheck probe) at INFO; our asl.server lines already cover command
+    # traffic, so only surface its genuine problems.
+    logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
 async def main():

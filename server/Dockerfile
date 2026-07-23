@@ -10,6 +10,7 @@ RUN mkdir /server
 
 COPY alexa.py /server/alexa.py
 COPY server.py /server/server.py
+COPY healthcheck.py /server/healthcheck.py
 COPY requirements.txt /server/requirements.txt
 
 ENV ASL_CONFIG_PATH="/config/"
@@ -22,6 +23,6 @@ RUN rm /server/requirements.txt
 EXPOSE 4000
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=15s \
-  CMD python3 -c "import socket; socket.create_connection(('127.0.0.1', 4000), timeout=5).close()"
+  CMD ["python3", "/server/healthcheck.py"]
 
 ENTRYPOINT ["python3","/server/server.py"]
